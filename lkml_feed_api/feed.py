@@ -32,6 +32,7 @@ class NNTPFetcher:
         self._state_file = Path(state_file) if state_file else None
         self._cursors: Dict[str, int] = {}  # group_name -> last_article_number
         self._conn: Optional[NNTP] = None
+        self._conn_lock = threading.Lock()
         self._body_concurrency = max(1, body_concurrency)
         self._local = threading.local()  # thread-local connections for parallel BODY
         self._load_state()
@@ -46,7 +47,7 @@ class NNTPFetcher:
             try:
                 self._conn.date()
                 return self._conn
-            except (NNTPError, OSError, EOFError):
+            except (NNTPError, OSError, EOFError, ValueError):
                 self._close_conn()
 
         max_attempts = 3
@@ -76,14 +77,15 @@ class NNTPFetcher:
         if self._conn is not None:
             try:
                 self._conn.quit()
-            except (NNTPError, OSError, EOFError):
+            except (NNTPError, OSError, EOFError, ValueError):
                 pass
             self._conn = None
 
     def close(self) -> None:
         """Close NNTP connection and save state."""
-        self._close_conn()
-        self._save_state()
+        with self._conn_lock:
+            self._close_conn()
+            self._save_state()
 
     # ------------------------------------------------------------------
     # Public
@@ -96,19 +98,20 @@ class NNTPFetcher:
 
     def rewind(self, group_name: str, n: int) -> None:
         """Rewind cursor by *n* articles."""
-        cursor = self._cursors.get(group_name)
-        if cursor is None:
-            last = self._group_with_retry(group_name)
-            if last is None:
-                return
-            cursor = last
-            self._cursors[group_name] = cursor
-        self._cursors[group_name] = max(0, cursor - n)
-        self._save_state()
-        logger.info(
-            "Rewound %s by %d: %d -> %d",
-            group_name, n, cursor, self._cursors[group_name],
-        )
+        with self._conn_lock:
+            cursor = self._cursors.get(group_name)
+            if cursor is None:
+                last = self._group_with_retry(group_name)
+                if last is None:
+                    return
+                cursor = last
+                self._cursors[group_name] = cursor
+            self._cursors[group_name] = max(0, cursor - n)
+            self._save_state()
+            logger.info(
+                "Rewound %s by %d: %d -> %d",
+                group_name, n, cursor, self._cursors[group_name],
+            )
 
     def fetch_latest(
         self,
@@ -150,61 +153,63 @@ class NNTPFetcher:
         """Return (entries, caught_up). caught_up is True when cursor reached last."""
         group_name = f"org.kernel.vger.{subsystem}"
 
-        # GROUP command with retry
-        last = self._group_with_retry(group_name)
-        if last is None:
-            return [], True
+        with self._conn_lock:
+            # GROUP command with retry
+            last = self._group_with_retry(group_name)
+            if last is None:
+                return [], True
 
-        cursor = self._cursors.get(group_name)
-        if cursor is None:
-            # First run: start from current latest (no history replay)
-            self._cursors[group_name] = last
+            cursor = self._cursors.get(group_name)
+            if cursor is None:
+                # First run: rewind so the first fetch returns data
+                cursor = max(0, last - _MAX_ARTICLES_PER_FETCH)
+                self._cursors[group_name] = cursor
+                self._save_state()
+                logger.info(
+                    "Initialized cursor for %s at article %d (rewound from %d)",
+                    group_name, cursor, last,
+                )
+
+            if cursor >= last:
+                return [], True  # No new articles
+
+            # Fetch from cursor+1 to last, capped at _MAX_ARTICLES_PER_FETCH
+            start = cursor + 1
+            end = min(last, cursor + _MAX_ARTICLES_PER_FETCH)
+            caught_up = end >= last
+
+            overviews = self._over_with_retry(group_name, start, end)
+            if overviews is None:
+                return [], True
+
+            # Filter by match_fn, collect entries that need BODY
+            matched: List[Tuple[int, MailEntry]] = []
+            for art_num, overview in overviews:
+                parsed = self._parse_overview(overview, subsystem)
+                if match_fn is not None and not match_fn(parsed):
+                    continue
+                matched.append((art_num, parsed))
+
+            # Fetch BODY (serial or parallel)
+            entries: List[MailEntry] = []
+            if matched:
+                bodies = self._fetch_bodies(group_name, [a for a, _ in matched])
+                for (_, parsed), body in zip(matched, bodies):
+                    if body:
+                        parsed = parsed.model_copy(update={"summary": body})
+                    entries.append(parsed)
+
+            self._cursors[group_name] = end
             self._save_state()
             logger.info(
-                "Initialized cursor for %s at article %d", group_name, last
+                "Fetched %d new articles from %s (%d-%d, caught_up=%s)",
+                len(entries),
+                group_name,
+                start,
+                end,
+                caught_up,
             )
-            return [], True
-
-        if cursor >= last:
-            return [], True  # No new articles
-
-        # Fetch from cursor+1 to last, capped at _MAX_ARTICLES_PER_FETCH
-        start = cursor + 1
-        end = min(last, cursor + _MAX_ARTICLES_PER_FETCH)
-        caught_up = end >= last
-
-        overviews = self._over_with_retry(group_name, start, end)
-        if overviews is None:
-            return [], True
-
-        # Filter by match_fn, collect entries that need BODY
-        matched: List[Tuple[int, MailEntry]] = []
-        for art_num, overview in overviews:
-            parsed = self._parse_overview(overview, subsystem)
-            if match_fn is not None and not match_fn(parsed):
-                continue
-            matched.append((art_num, parsed))
-
-        # Fetch BODY (serial or parallel)
-        entries: List[MailEntry] = []
-        if matched:
-            bodies = self._fetch_bodies(group_name, [a for a, _ in matched])
-            for (_, parsed), body in zip(matched, bodies):
-                if body:
-                    parsed = parsed.model_copy(update={"summary": body})
-                entries.append(parsed)
-
-        self._cursors[group_name] = end
-        self._save_state()
-        logger.info(
-            "Fetched %d new articles from %s (%d-%d, caught_up=%s)",
-            len(entries),
-            group_name,
-            start,
-            end,
-            caught_up,
-        )
-        return entries, caught_up
+            return entries, caught_up
 
     # ------------------------------------------------------------------
     # NNTP commands with retry
@@ -219,7 +224,7 @@ class NNTPFetcher:
                 conn = self._connect()
                 _resp, _count, _first, last, _name = conn.group(group_name)
                 return last
-            except (NNTPError, OSError, EOFError) as e:
+            except (NNTPError, OSError, EOFError, ValueError) as e:
                 logger.warning(
                     "Attempt %d/%d GROUP %s: %s: %s",
                     attempt,
@@ -251,7 +256,7 @@ class NNTPFetcher:
                 conn.group(group_name)  # must select group before OVER
                 _resp, overviews = conn.over((start, end))
                 return overviews
-            except (NNTPError, OSError, EOFError) as e:
+            except (NNTPError, OSError, EOFError, ValueError) as e:
                 logger.warning(
                     "Attempt %d/%d OVER %d-%d on %s: %s: %s",
                     attempt,
@@ -356,7 +361,7 @@ class NNTPFetcher:
                 line.decode("utf-8", errors="replace") for line in info.lines
             ]
             return "\n".join(lines)
-        except (NNTPError, OSError, EOFError) as e:
+        except (NNTPError, OSError, EOFError, ValueError) as e:
             logger.warning("Failed to fetch BODY %d: %s", article_num, e)
             self._close_conn()
             return None
@@ -372,7 +377,7 @@ class NNTPFetcher:
                 line.decode("utf-8", errors="replace") for line in info.lines
             ]
             return "\n".join(lines)
-        except (NNTPError, OSError, EOFError) as e:
+        except (NNTPError, OSError, EOFError, ValueError) as e:
             logger.warning("Failed to fetch BODY %d: %s", article_num, e)
             self._close_thread_conn()
             return None
@@ -383,7 +388,7 @@ class NNTPFetcher:
         if conn is not None:
             try:
                 conn.date()
-            except (NNTPError, OSError, EOFError):
+            except (NNTPError, OSError, EOFError, ValueError):
                 self._close_thread_conn()
                 conn = None
         if conn is None:
@@ -397,7 +402,7 @@ class NNTPFetcher:
         if conn is not None:
             try:
                 conn.quit()
-            except (NNTPError, OSError, EOFError):
+            except (NNTPError, OSError, EOFError, ValueError):
                 pass
             self._local.conn = None
 

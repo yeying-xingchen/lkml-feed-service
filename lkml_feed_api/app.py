@@ -50,7 +50,11 @@ def latest() -> ApiResponse:
 @app.post("/rewind")
 def rewind(n: int) -> ApiResponse:
     client.rewind(n)
-    return ApiResponse(message=f"rewound {n} messages")
+    result = client.get_latest()
+    return ApiResponse(
+        message=f"rewound {n} messages",
+        data={"entries": [e.model_dump() for e in result.entries]},
+    )
 
 
 @app.post("/reset")
